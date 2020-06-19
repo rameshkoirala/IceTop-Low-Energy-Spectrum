@@ -1,0 +1,114 @@
+
+Important Notice:
+	You will find files name with '..slcQcut..'. Even though SLC is not used, the name is kept as it is from the past so that previously written scripts can be used as it is.
+
+# -------- Detector Simulation --------------
+# Cobalt (/data/user/rkoirala/CORSIKA/)
+	$ ./DetectorSim_create_submit.py
+
+# Submitter
+	$ condor_submit_dag -maxjobs 10 condor_10410.submit
+
+  Require: run_detector_simulation.sh, fullSimulation.py
+
+# -------- Level1 --------------
+# Asterix (/data/icet0/rkoirala/)
+  Example below is done for proton shower. Change dataset number accordingly.
+	$ ./Level1_create_submit.py 10410
+  Then:
+    $ ./run_sbatch_level1.sh 10410
+
+  Require: SimulationFiltering.py
+
+# -------- Level2 --------------
+# Asterix
+  Example below is done for proton shower. Change dataset number accordingly.
+	$ ./Level2_create_submit.py 10410
+  Then:
+    $ ./run_sbatch_level2.sh 10410 
+
+  Require: Level2_ML_MC.py
+
+
+# ============== Reconstruction Begins Here =====================
+
+# ------- Create Single Files ------------
+# Asterix:
+  Save data in a single file for easier and faster processing.
+  In a meanwhile, TankX, TankY, TankZ, HitsTime, and Pulses of shape (number of events, 35) are also created for all simulated data and 10% of experimental data.
+  For all experimental data, 'spark_prepare_data.py' is used later to produce TankX, TankY, TankZ, HitsTime, and Pulses.
+
+  Simulation: 
+      Collect simulated data for all particles (proton, helium, oxygen, and iron) and all energy bins (log10GeV: 4-7.4) 
+      and combine them into a single file.
+      This file (one for Sibyll2.1 and one for QGSJetII-04) will be used for further processing 
+      of simulation. No need to come back to the Level2 folder again and again.
+
+  Experiment:
+      Collect data from Runs ending with '0'. This file will be used for data-mc comparison.
+
+  Run:
+      $ python booking_data_mc.py --isMC
+      $ python booking_data_mc.py --isMC --isqgsjet
+      $ python booking_data_mc.py --isExp
+
+# -------------Split and then merge simulated data -----------------
+# Asterix:
+  Idea here is to split all MC simulation events randomly into two files. 
+  Use one of them for training and the other one for testing and predicting.
+  Then merge those files and create a final file.
+
+  For Example (Split):
+    Inout: 
+      analysis_simulation_HLCCoreSeed_slcQcut_all.h5 ($ python booking_data_mc.py --isMC)
+    Output:
+      1.analysis_simulation_HLCCoreSeed_slcQcut_1sthalf.h5
+      2.analysis_simulation_HLCCoreSeed_slcQcut_2ndhalf.h5
+  For Example (Merge):
+    Inout: 
+      1.analysis_simulation_HLCCoreSeed_slcQcut_1sthalf.h5
+      2.analysis_simulation_HLCCoreSeed_slcQcut_2ndhalf.h5
+    Output:
+      analysis_simulation_HLCCoreSeed_slcQcut_final.h5 
+      (This file is copied and saved as 'analysis_simulation_HLCCoreSeed_slcQcut_fracradius_final.h5'. All energy reconstruction is done using this new file. Reason for that is if anything goes wrong with the file, we can always go back and start from 'analysis_simulation_HLCCoreSeed_slcQcut_final.h5'.)
+
+  Run:
+      $ python spark_prepare_mc.py --split
+      $ python spark_prepare_mc.py --split --isqgsjet
+    After running random forest regression
+      $ python spark_prepare_mc.py --merge
+      $ python spark_prepare_mc.py --merge --isqgsjet
+
+# ------ Run random forest regression to train and predict x, y, and zenith --------
+Prepare experimental data for reconstruction.
+Produce TankX, TankY, TankZ, HitsTime, and Pulses of shape (number of events, 35) on run-by-run basis. These variables are required to predict X, Y, zenith and energy for experimental data.
+# Asterix:
+    $ spark_prepare_data_create_submit.py
+  Require: spark_prepare_data.py
+
+  Then run 'spark_cv.py' to train and predict x, y, and zenith of simulation. Change what to run from inside spark_cv.py.
+    $ $SPARK_HOME/bin/spark-submit --master spark://asterix-node04:7077 \
+                                          --executor-memory 9G \
+                                          --total-executor-cores 50 \
+                                               spark_cv.py
+
+  Models to predict x, y, and zenith are ready by now. Use them to predict x, y, and zenith of experimental data.
+    $ python spark_predict_data_submit.py   # Change what to run from inside spark_predict_data_submit.py.
+  Require: spark_predict_data.py
+
+# -------- Energy Prediction ------------
+# Asterix:
+    Use 'sklearn_predict_energy_h4aOrig.py' script to predict energy of events from experimental data.
+    First create a model from simulations with Sibyll2.1 and QGSJetII-04 and save it.
+    Then use the saved model to predict energy of events from experimental data.
+    Experimental data is huge, one per Run number. Use 'sklearn_predict_energy_exp_create_submit.py' to submit one job per Run number in Asterix cluster. 
+
+    To Run:
+        $ python sklearn_predict_energy_h4aOrig.py --savemodel --isMC --savehdf --do predict -f analysis_simulation_HLCCoreSeed_slcQcut_fracradius_final.h5
+        $ python sklearn_predict_energy_h4aOrig.py --savemodel --isMC --isqgsjet --savehdf --do predict -f analysis_simulation_HLCCoreSeed_slcQcut_everything_qgsjet_final.h5
+        $ python sklearn_predict_energy_h4aOrig.py --isExp --savehdf --usesavedmodel --do predict -f {hfname} # done using 'sklearn_predict_energy_exp_create_submit.py'
+    
+    Saved Models:
+        rfr_finalized_model_all_h4aOrig.sav
+        rfr_finalized_model_all_h4aOrig_QGSJET.sav
+
